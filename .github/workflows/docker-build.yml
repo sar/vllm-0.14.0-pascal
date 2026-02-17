@@ -1,0 +1,141 @@
+name: Build & Push Docker Image (Pascal)
+
+# ── Triggers ───────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: ["master"]
+    tags:
+      - "v*"              # e.g. v0.14.0-pascal
+  pull_request:
+    branches: ["master"]
+  workflow_dispatch:      # manual run from GitHub UI
+    inputs:
+      release_tag:
+        description: "GitHub Release tag to pull wheels from"
+        required: false
+        default: "v0.14.0-pascal"
+      push_image:
+        description: "Push image to registry?"
+        required: false
+        default: "true"
+        type: boolean
+
+# ── Permissions for GHCR ──────────────────────────────────────────────────────
+permissions:
+  contents: read
+  packages: write
+
+# ── Concurrency: cancel redundant runs on the same branch ─────────────────────
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout (only needs the Dockerfile, not the whl files) ──────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Resolve which release tag to pull wheels from ─────────────────────────
+      - name: Resolve release tag
+        id: release
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${{ github.ref_name }}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="v0.14.0-pascal"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Wheels will be downloaded from release: ${TAG}"
+
+      # ── Verify the release assets are accessible before building ─────────────
+      - name: Verify release assets exist
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          BASE: https://github.com/shu1qin9/vllm-0.14.0-pascal/releases/download
+        run: |
+          check() {
+            URL="${BASE}/${TAG}/${1}"
+            STATUS=$(curl -o /dev/null -sI -w "%{http_code}" -L "$URL")
+            if [ "$STATUS" != "200" ]; then
+              echo "Asset not found (HTTP $STATUS): $URL"
+              exit 1
+            fi
+            echo "Found: $URL"
+          }
+          check "vllm-0.14.0rc1.dev122+g42826bbcc.d20251226.cu128-cp312-cp312-linux_x86_64.whl"
+          check "torch-2.9.1a0+gitd38164a-cp312-cp312-linux_x86_64.whl"
+          check "triton-3.6.0+git9e449252-cp312-cp312-linux_x86_64.whl"
+
+      # ── Free up disk space (whl + layers are large) ───────────────────────────
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          df -h
+
+      # ── Buildx ────────────────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:latest
+
+      # ── Login to GHCR (skip on PRs) ───────────────────────────────────────────
+      - name: Log in to GitHub Container Registry
+        if: |
+          github.event_name != 'pull_request' &&
+          (github.event_name != 'workflow_dispatch' || inputs.push_image == 'true')
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Generate image tags ───────────────────────────────────────────────────
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=tag
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
+            type=raw,value=0.14.0-pascal,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+
+      # ── Build & push ──────────────────────────────────────────────────────────
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push_image == 'true') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            RELEASE_TAG=${{ steps.release.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Summary ───────────────────────────────────────────────────────────────
+      - name: Build summary
+        run: |
+          echo "## Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Release tag** | \`${{ steps.release.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image digest** | \`${{ steps.build.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tags** | \`${{ steps.meta.outputs.tags }}\` |" >> $GITHUB_STEP_SUMMARY
