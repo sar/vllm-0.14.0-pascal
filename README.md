@@ -1,75 +1,131 @@
-# 总览
+# Overview
 
-本文主要记录修改vllm相关代码，来适配Pascal框架，涉及到以下内容
+This document covers the changes made to vLLM and related packages to add support for Pascal-architecture GPUs, specifically:
 
- - [x] vllm 0.14.0 修改及build
- - [x] pytorch 2.9.1 修改及build
- - [x] triton 3.6.0 修改及build
+- [x] vLLM 0.14.0 — patched & built
+- [x] PyTorch 2.9.1 — patched & built
+- [x] Triton 3.6.0 — patched & built
 
-本文 patch 思路来自于大佬的项目：[vllm-pascal](https://github.com/ampir-nn/vllm-pascal)，同时适配了新版本的部分语法
-# 正文
+The patching approach is based on [vllm-pascal](https://github.com/ampir-nn/vllm-pascal), updated to handle syntax changes in the newer versions.
 
-## 背景
+# Details
 
-我在本地通过P40搭建了一套算力系统，但是vllm部署时，由于P40系统架构较老，导致模型部署时，会遇到很多架构不适配的错误
+## Background
 
-网上找到了针对于 vllm 0.10.2、vllm 0.11.0 这两个版本的魔改： [vllm-pascal](https://github.com/ampir-nn/vllm-pascal)，但是这两个版本在部署`AutoGLM-Phone-9B` 等最新模型时，遇到了api不适配的问题，所以自己按照大佬的patch，重新build了最新的 vllm
-## 使用方案
+I run a local compute setup using an NVIDIA P40. When trying to deploy models with vLLM, the P40's older Pascal architecture causes a number of compatibility errors out of the box.
 
-我重新build后的GitHub仓库：https://github.com/shu1qin9/vllm-0.14.0-pascal
+I found an existing project — [vllm-pascal](https://github.com/ampir-nn/vllm-pascal) — that patches vLLM 0.10.2 and 0.11.0 for Pascal, but those older versions hit API compatibility issues with newer models like `AutoGLM-Phone-9B`. So I applied the same patching approach to build the latest vLLM from scratch.
+
+---
+
+## Option 1: Docker (Recommended)
+
+A Docker image is automatically built and published to the GitHub Container Registry (GHCR) via GitHub Actions whenever a new release is tagged.
+
+The image is based on `nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04` and comes with all three patched wheels pre-installed in the correct order — no manual setup required.
+
+### Prerequisites
+
+Your host machine needs `nvidia-container-toolkit` installed so Docker can access the GPU:
+
+```shell
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+### Pull the image
+
+```shell
+docker pull ghcr.io/<your-github-username>/vllm-0.14.0-pascal:latest
+```
+
+> If the package is private, authenticate first:
+> ```shell
+> echo "<your-github-pat>" | docker login ghcr.io -u <your-github-username> --password-stdin
+> ```
+> Or go to your repo → **Packages** → the image → **Package settings** → set visibility to **Public**.
+
+### Run
+
+```shell
+docker run --rm --gpus all \
+  -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/<your-github-username>/vllm-0.14.0-pascal:latest \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --dtype float16
+```
+
+Key flags:
+- `--gpus all` — exposes your Pascal GPU(s) to the container
+- `-p 8000:8000` — exposes the OpenAI-compatible REST API on the host
+- `-v ~/.cache/huggingface:...` — mounts your local model cache so models aren't re-downloaded on every run
+
+### Test it's working
+
+```shell
+curl http://localhost:8000/v1/models
+```
+
+### How the CI build works
+
+The GitHub Actions workflow (`.github/workflows/docker-build.yml`) triggers on every push to `master` and on any `v*` tag. It:
+
+1. Resolves which release tag to pull wheels from (defaults to `v0.14.0-pascal`, or the pushed git tag if triggered by a tag push)
+2. Verifies all three `.whl` assets are accessible on the release before starting the build
+3. Builds the Docker image — the `Dockerfile` downloads the wheels directly from the GitHub Release via `curl` during the build, so no large files need to be checked into the repo
+4. Pushes the image to GHCR tagged with `latest`, the release version (`0.14.0-pascal`), and a short git SHA for traceability
+
+You can also trigger a build manually from the **Actions** tab in GitHub, with the option to specify a different release tag or skip pushing the image.
+
+---
+
+## Option 2: Manual Installation
+
+If you'd prefer to install the wheels directly into a local Python environment:
+
+### Download the wheels
+
+Grab the three `.whl` files from the [latest release](https://github.com/shu1qin9/vllm-0.14.0-pascal/releases/tag/v0.14.0-pascal):
 
 ![image.png](https://lsq-markdown.oss-cn-hangzhou.aliyuncs.com/wiki20251226171434.png)
 
-
-下载最新的三个 `whl` 文件，然后创建最新的 python env 环境，就可以开始对应的工作，相关shell如下
+### Install
 
 ```shell
-# python env 创建
+# Create virtual environment
 python3 -m venv pyenv-P40
 source pyenv-p40/bin/activate
 
-# vllm安装
+# Install patched vLLM
 pip install vllm-0.14.0rc1.dev122+g42826bbcc.d20251226.cu128-cp312-cp312-linux_x86_64.whl
 ```
 
-注意，安装打过补丁的vllm后，要先卸载triton、torch，vllm 会自动安装这两个包，按照下面命令执行即可
+> **Important:** Installing vLLM will automatically pull in stock versions of torch and triton as dependencies. You need to replace these with the patched builds:
 
 ```shell
-# triton、torch 安装
+# Remove stock torch and triton, install patched versions
 pip uninstall torch triton -y
 
 pip install triton-3.6.0+git9e449252-cp312-cp312-linux_x86_64.whl
 pip install torch-2.9.1a0+gitd38164a-cp312-cp312-linux_x86_64.whl
 ```
 
-这里在安装 triton 补丁时，会出现依赖版本的Error，无需关注，所有的安装完成后，`pip list`，可以看到以下内容
+> **Note:** You may see a dependency version error when installing the patched triton — this can be safely ignored.
 
-只要 list 中对应的三个库，是我们补丁过的即可
+Once everything is installed, run `pip list` and verify the three patched packages are present:
 
 ```shell
-sniffio                           1.3.1
-sse-starlette                     3.0.4
-starlette                         0.50.0
-supervisor                        4.3.0
-sympy                             1.14.0
-tabulate                          0.9.0
-tiktoken                          0.12.0
-tokenizers                        0.22.1
 torch                             2.9.1a0+gitd38164a
-torchaudio                        2.9.1
-torchvision                       0.24.1
-tqdm                              4.67.1
-transformers                      4.57.3
 triton                            3.6.0+git9e449252
-typer                             0.21.0
-typing_extensions                 4.15.0
-typing-inspection                 0.4.2
-urllib3                           2.6.2
-uvicorn                           0.40.0
-uvloop                            0.22.1
 vllm                              0.14.0rc1.dev122+g42826bbcc.d20251226.cu128
 ```
 
 ![image.png](https://lsq-markdown.oss-cn-hangzhou.aliyuncs.com/wiki20251226171940.png)
 
-接下来 python vllm 启动大模型即可
+You can now launch vLLM and serve models as normal.
