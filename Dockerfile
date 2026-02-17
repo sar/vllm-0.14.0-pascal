@@ -27,16 +27,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 # ── Download patched wheels from GitHub Releases ───────────────────────────────
+# Keep original filenames so pip can validate the wheel format
 WORKDIR /wheels
-RUN curl -fSL "${RELEASE_BASE}/${VLLM_WHL}"   -o vllm.whl   \
- && curl -fSL "${RELEASE_BASE}/${TORCH_WHL}"  -o torch.whl  \
- && curl -fSL "${RELEASE_BASE}/${TRITON_WHL}" -o triton.whl
+RUN curl -fSL "${RELEASE_BASE}/${VLLM_WHL}"   -o "${VLLM_WHL}"   \
+ && curl -fSL "${RELEASE_BASE}/${TORCH_WHL}"  -o "${TORCH_WHL}"  \
+ && curl -fSL "${RELEASE_BASE}/${TRITON_WHL}" -o "${TRITON_WHL}"
 
 # ── Install in the correct order ───────────────────────────────────────────────
-RUN pip install --no-cache-dir --break-system-packages vllm.whl \
+RUN pip install --no-cache-dir --break-system-packages "${VLLM_WHL}" \
  && pip uninstall -y torch triton \
- && pip install --no-cache-dir --break-system-packages --no-deps triton.whl \
- && pip install --no-cache-dir --break-system-packages --no-deps torch.whl \
+ && pip install --no-cache-dir --break-system-packages --no-deps "${TRITON_WHL}" \
+ && pip install --no-cache-dir --break-system-packages --no-deps "${TORCH_WHL}" \
  && rm -rf /wheels
 
 # ── Runtime ────────────────────────────────────────────────────────────────────
