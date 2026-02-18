@@ -14,18 +14,55 @@ ARG TORCH_WHL=torch-2.9.1a0+gitd38164a-cp312-cp312-linux_x86_64.whl
 ARG TRITON_WHL=triton-3.6.0+git9e449252-cp312-cp312-linux_x86_64.whl
 
 ENV VENV=/opt/venv
-
-# ── System dependencies ────────────────────────────────────────────────────────
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 \
-      python3-venv \
-      python3-pip \
-      curl \
-      git \
-    && rm -rf /var/lib/apt/lists/*
 
-# ── Create virtualenv — this sidesteps PEP 668 / externally-managed-environment
+# ── System runtime dependencies ───────────────────────────────────────────────
+# Sourced from official vLLM Dockerfile + torch/triton/NCCL requirements
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Python
+    python3 \
+    python3-venv \
+    python3-pip \
+    # Basic tools
+    curl \
+    git \
+    # OpenMP — required by torch/triton (fixes: libgomp.so.1 not found)
+    libgomp1 \
+    # C++ standard library runtime
+    libstdc++6 \
+    # Fortran runtime — required by scipy/numpy BLAS routines
+    libgfortran5 \
+    # NUMA memory management — torch memory allocator
+    libnuma1 \
+    # InfiniBand verbs — required by NCCL for GPU-GPU communication
+    libibverbs1 \
+    # OpenMPI runtime — used by some distributed backends
+    libopenmpi3 \
+    # OpenCV runtime libs (opencv-python-headless is a vLLM dep)
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    # Image codec libs — required by Pillow (another vLLM dep)
+    libjpeg-turbo8 \
+    libpng16-16 \
+    libwebp7 \
+    # zlib — compression, used widely
+    zlib1g \
+    # libtinfo — required by LLVM which triton depends on
+    libtinfo6 \
+    # proc filesystem utils — used by psutil (vLLM dep)
+    procps \
+  && rm -rf /var/lib/apt/lists/*
+
+# ── CUDA compat layer ─────────────────────────────────────────────────────────
+# Ensures the CUDA 12.8 compat libs are on the dynamic linker path.
+# Sourced directly from the official vLLM Dockerfile.
+RUN echo "/usr/local/cuda-12.8/compat/" > /etc/ld.so.conf.d/cuda-compat.conf \
+ && ldconfig
+
+# ── Create virtualenv — sidesteps PEP 668 ─────────────────────────────────────
 RUN python3 -m venv ${VENV}
 ENV PATH="${VENV}/bin:${PATH}"
 
@@ -44,6 +81,18 @@ RUN pip install --no-cache-dir "${VLLM_WHL}" \
  && pip install --no-cache-dir --no-deps "${TRITON_WHL}" \
  && pip install --no-cache-dir --no-deps "${TORCH_WHL}" \
  && rm -rf /wheels
+
+# ── Build-time sanity check ────────────────────────────────────────────────────
+# Verifies all shared libs resolve correctly without needing a GPU.
+# If libgomp, libibverbs, or anything else is missing this fails the build
+# immediately rather than silently shipping a broken image.
+RUN python -c "
+import vllm, torch, triton
+print('vLLM  :', vllm.__version__)
+print('torch :', torch.__version__)
+print('triton:', triton.__version__)
+print('All shared libraries resolved OK')
+"
 
 # ── Runtime ────────────────────────────────────────────────────────────────────
 WORKDIR /app
