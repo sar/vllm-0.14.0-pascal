@@ -23,7 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # The patched torch (installed with --no-deps) links against system CUDA libs
 # rather than the pip-bundled nvidia-*-cu12 packages. We install the full set
 # from NVIDIA's apt repo (pre-configured in all nvidia/cuda base images).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     # ── Python ──────────────────────────────────────────────────────────────
     python3 \
     python3-venv \
@@ -31,7 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     # ── Core system runtime libs ─────────────────────────────────────────────
-    libgomp1 \          
+    libgomp1 \
     libstdc++6 \
     libgfortran5 \
     libnuma1 \
