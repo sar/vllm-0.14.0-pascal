@@ -1,14 +1,13 @@
 name: Build & Push Docker Image (Pascal)
 
-# ── Triggers ───────────────────────────────────────────────────────────────────
 on:
   push:
     branches: ["master"]
     tags:
-      - "v*"              # e.g. v0.14.0-pascal
+      - "v*"
   pull_request:
     branches: ["master"]
-  workflow_dispatch:      # manual run from GitHub UI
+  workflow_dispatch:
     inputs:
       release_tag:
         description: "GitHub Release tag to pull wheels from"
@@ -20,12 +19,10 @@ on:
         default: "true"
         type: boolean
 
-# ── Permissions for GHCR ──────────────────────────────────────────────────────
 permissions:
   contents: read
   packages: write
 
-# ── Concurrency: cancel redundant runs on the same branch ─────────────────────
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -39,11 +36,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ── Checkout (only needs the Dockerfile, not the whl files) ──────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── Resolve which release tag to pull wheels from ─────────────────────────
       - name: Resolve release tag
         id: release
         run: |
@@ -57,7 +52,6 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Wheels will be downloaded from release: ${TAG}"
 
-      # ── Verify the release assets are accessible before building ─────────────
       - name: Verify release assets exist
         env:
           TAG: ${{ steps.release.outputs.tag }}
@@ -76,19 +70,16 @@ jobs:
           check "torch-2.9.1a0+gitd38164a-cp312-cp312-linux_x86_64.whl"
           check "triton-3.6.0+git9e449252-cp312-cp312-linux_x86_64.whl"
 
-      # ── Free up disk space (whl + layers are large) ───────────────────────────
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
           df -h
 
-      # ── Buildx ────────────────────────────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver-opts: image=moby/buildkit:latest
 
-      # ── Login to GHCR (skip on PRs) ───────────────────────────────────────────
       - name: Log in to GitHub Container Registry
         if: |
           github.event_name != 'pull_request' &&
@@ -99,7 +90,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Generate image tags ───────────────────────────────────────────────────
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -114,28 +104,61 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
             type=raw,value=0.14.0-pascal,enable=${{ startsWith(github.ref, 'refs/tags/') }}
 
-      # ── Build & push ──────────────────────────────────────────────────────────
-      - name: Build and push Docker image
-        id: build
+      # Build locally first (no push yet) so we can smoke test it
+      - name: Build image (local)
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push_image == 'true') }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          # Load into local docker daemon for smoke testing
+          load: true
+          tags: vllm-pascal-test:latest
           build-args: |
             RELEASE_TAG=${{ steps.release.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ── Summary ───────────────────────────────────────────────────────────────
+      # ── Smoke test — no GPU in CI, so we only test shared lib resolution.
+      # vllm cannot be imported without a GPU (it does CUDA device detection).
+      # torch + triton imports are sufficient to catch missing .so files.
+      - name: Smoke test — verify shared libs and imports
+        run: |
+          echo "--- Testing torch/triton import and shared library linkage ---"
+          docker run --rm vllm-pascal-test:latest python -c "import torch, triton; print('torch:', torch.__version__); print('triton:', triton.__version__); print('Shared library check passed')"
+
+      - name: Smoke test — verify CLI entrypoint responds
+        run: |
+          echo "--- Testing vLLM CLI entrypoint ---"
+          docker run --rm vllm-pascal-test:latest --help | head -5
+          echo "Entrypoint OK"
+
+      # ── Push to GHCR only after smoke tests pass ──────────────────────────────
+      - name: Push image to GHCR
+        if: |
+          github.event_name != 'pull_request' &&
+          (github.event_name != 'workflow_dispatch' || inputs.push_image == 'true')
+        uses: docker/build-push-action@v5
+        id: push
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            RELEASE_TAG=${{ steps.release.outputs.tag }}
+          # Cache is already warm from the local build above
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Build summary
         run: |
           echo "## Docker Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "| | |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| **Release tag** | \`${{ steps.release.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Image digest** | \`${{ steps.build.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Smoke test** | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image digest** | \`${{ steps.push.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Tags** | \`${{ steps.meta.outputs.tags }}\` |" >> $GITHUB_STEP_SUMMARY
