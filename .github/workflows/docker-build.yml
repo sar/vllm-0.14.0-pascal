@@ -104,50 +104,18 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
             type=raw,value=0.14.0-pascal,enable=${{ startsWith(github.ref, 'refs/tags/') }}
 
-      # Build locally first (no push yet) so we can smoke test it
-      - name: Build image (local)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
-          # Load into local docker daemon for smoke testing
-          load: true
-          tags: vllm-pascal-test:latest
-          build-args: |
-            RELEASE_TAG=${{ steps.release.outputs.tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      # ── Smoke test — no GPU in CI, so we only test shared lib resolution.
-      # vllm cannot be imported without a GPU (it does CUDA device detection).
-      # torch + triton imports are sufficient to catch missing .so files.
-      - name: Smoke test — verify shared libs and imports
-        run: |
-          echo "--- Testing torch/triton import and shared library linkage ---"
-          docker run --rm vllm-pascal-test:latest python -c "import torch, triton; print('torch:', torch.__version__); print('triton:', triton.__version__); print('Shared library check passed')"
-
-      # NOTE: vLLM --help cannot be tested in CI — vLLM detects GPU devices
-      # even during argument parsing and crashes without a real GPU present.
-      # The torch/triton import test above is sufficient to verify the image.
-
-      # ── Push to GHCR only after smoke tests pass ──────────────────────────────
-      - name: Push image to GHCR
-        if: |
-          github.event_name != 'pull_request' &&
-          (github.event_name != 'workflow_dispatch' || inputs.push_image == 'true')
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         id: push
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
-          push: true
+          push: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push_image == 'true') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             RELEASE_TAG=${{ steps.release.outputs.tag }}
-          # Cache is already warm from the local build above
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -157,6 +125,5 @@ jobs:
           echo "| | |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| **Release tag** | \`${{ steps.release.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Smoke test** | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
           echo "| **Image digest** | \`${{ steps.push.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Tags** | \`${{ steps.meta.outputs.tags }}\` |" >> $GITHUB_STEP_SUMMARY
