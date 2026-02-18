@@ -1,4 +1,7 @@
-# ── Base image: CUDA 12.8 + cuDNN, Ubuntu 24.04 ──────────────────────────────
+# ── Base image: CUDA 12.8 + cuDNN runtime, Ubuntu 24.04 ──────────────────────
+# The -runtime variant includes cudart + cudnn but NOT cupti, nvrtc, cufft etc.
+# We install the missing CUDA 12.8 apt packages below from NVIDIA's repo,
+# which is pre-configured in all nvidia/cuda Docker images.
 FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04
 
 LABEL org.opencontainers.image.title="vLLM 0.14.0 Pascal Patch" \
@@ -16,53 +19,59 @@ ARG TRITON_WHL=triton-3.6.0+git9e449252-cp312-cp312-linux_x86_64.whl
 ENV VENV=/opt/venv
 ENV DEBIAN_FRONTEND=noninteractive
 
-# ── System runtime dependencies ───────────────────────────────────────────────
-# Sourced from official vLLM Dockerfile + torch/triton/NCCL requirements
+# ── System + CUDA runtime dependencies ────────────────────────────────────────
+# The patched torch (installed with --no-deps) links against system CUDA libs
+# rather than the pip-bundled nvidia-*-cu12 packages. We install the full set
+# from NVIDIA's apt repo (pre-configured in all nvidia/cuda base images).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Python
+    # ── Python ──────────────────────────────────────────────────────────────
     python3 \
     python3-venv \
     python3-pip \
-    # Basic tools
     curl \
     git \
-    # OpenMP — required by torch/triton (fixes: libgomp.so.1 not found)
-    libgomp1 \
-    # C++ standard library runtime
+    # ── Core system runtime libs ─────────────────────────────────────────────
+    libgomp1 \          
     libstdc++6 \
-    # Fortran runtime — required by scipy/numpy BLAS routines
     libgfortran5 \
-    # NUMA memory management — torch memory allocator
     libnuma1 \
-    # InfiniBand verbs — required by NCCL for GPU-GPU communication
     libibverbs1 \
-    # OpenMPI runtime — used by some distributed backends
     libopenmpi3 \
-    # OpenCV runtime libs (opencv-python-headless is a vLLM dep)
+    libtinfo6 \
+    procps \
+    # ── OpenCV runtime (opencv-python-headless is a vLLM dep) ────────────────
     libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender1 \
-    # Image codec libs — required by Pillow (another vLLM dep)
+    # ── Image codecs (Pillow dep) ────────────────────────────────────────────
     libjpeg-turbo8 \
     libpng16-16 \
     libwebp7 \
-    # zlib — compression, used widely
-    zlib1g \
-    # libtinfo — required by LLVM which triton depends on
-    libtinfo6 \
-    # proc filesystem utils — used by psutil (vLLM dep)
-    procps \
+    # ── CUDA 12.8 libraries missing from the -runtime base image ─────────────
+    # libcupti.so.12  — CUDA Profiling Tools, required by torch on import
+    cuda-cupti-12-8 \
+    # libnvrtc.so.12  — CUDA Runtime Compilation, required by torch/triton JIT
+    cuda-nvrtc-12-8 \
+    # libcufft.so.11  — CUDA FFT
+    libcufft-12-8 \
+    # libcurand.so.10 — CUDA Random Number Generation
+    libcurand-12-8 \
+    # libcusolver.so.11 — CUDA Dense/Sparse linear algebra
+    libcusolver-12-8 \
+    # libcusparse.so.12 — CUDA Sparse BLAS
+    libcusparse-12-8 \
+    # libnccl.so.2    — NVIDIA Collective Communications (multi-GPU)
+    libnccl2 \
+    # libnvToolsExt   — NVTX profiling markers used by torch
+    cuda-nvtx-12-8 \
   && rm -rf /var/lib/apt/lists/*
 
-# ── CUDA compat layer ─────────────────────────────────────────────────────────
-# Ensures the CUDA 12.8 compat libs are on the dynamic linker path.
-# Sourced directly from the official vLLM Dockerfile.
-RUN echo "/usr/local/cuda-12.8/compat/" > /etc/ld.so.conf.d/cuda-compat.conf \
- && ldconfig
+# ── Update dynamic linker cache so all newly installed .so files are found ────
+RUN ldconfig
 
-# ── Create virtualenv — sidesteps PEP 668 ─────────────────────────────────────
+# ── Create virtualenv — sidesteps PEP 668 externally-managed-environment ──────
 RUN python3 -m venv ${VENV}
 ENV PATH="${VENV}/bin:${PATH}"
 
@@ -73,9 +82,9 @@ RUN curl -fSL "${RELEASE_BASE}/${VLLM_WHL}"   -o "${VLLM_WHL}"   \
  && curl -fSL "${RELEASE_BASE}/${TRITON_WHL}" -o "${TRITON_WHL}"
 
 # ── Install in the correct order ───────────────────────────────────────────────
-# 1. vllm (pulls in stock torch + triton as deps)
-# 2. uninstall stock torch/triton
-# 3. install patched builds
+# 1. vllm (pulls in stock torch + triton as deps, plus all nvidia-*-cu12 pkgs)
+# 2. uninstall stock torch/triton (keep the nvidia-*-cu12 pip packages)
+# 3. install patched torch/triton with --no-deps
 RUN pip install --no-cache-dir "${VLLM_WHL}" \
  && pip uninstall -y torch triton \
  && pip install --no-cache-dir --no-deps "${TRITON_WHL}" \
@@ -83,11 +92,11 @@ RUN pip install --no-cache-dir "${VLLM_WHL}" \
  && rm -rf /wheels
 
 # ── Build-time sanity check ────────────────────────────────────────────────────
-# Verifies all shared libs resolve correctly without needing a GPU.
-# If libgomp, libibverbs, or anything else is missing this fails the build
-# torch import alone verifies libgomp, libstdc++, libibverbs etc resolve OK.
-# vllm cannot be imported at build time - it does CUDA device detection on import
-RUN python -c "import torch; print('torch:', torch.__version__); print('Shared library check OK')" 
+# Imports torch and triton to verify all .so files resolve.
+# vllm cannot be imported here — it requires a real GPU on import.
+# If any shared lib is still missing (libcupti, libnvrtc, etc.) this fails fast.
+RUN python -c "import torch; print('torch:', torch.__version__); print('CUDA available (no GPU at build time):', torch.cuda.is_available()); print('Shared library check OK')"
+RUN python -c "import triton; print('triton:', triton.__version__); print('triton OK')"
 
 # ── Runtime ────────────────────────────────────────────────────────────────────
 WORKDIR /app
